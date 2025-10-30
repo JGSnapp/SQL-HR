@@ -3,14 +3,15 @@ version: "3.9"
 services:
   agent_server:
     build:
-      context: .
-      dockerfile: agent_server/Dockerfile
+      context: ./agent_server
+      dockerfile: Dockerfile
+    env_file:
+      - .env
     ports:
       - "8000:8000"
-    environment:
-      API_MODEL: ${API_MODEL}
-      API_KEY: ${API_KEY}
-      BASE_URL: ${BASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: ankane/pgvector
@@ -21,10 +22,10 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - pgdata:POSTGRES_USER/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
       - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -33,12 +34,15 @@ services:
     image: dpage/pgadmin4
     container_name: pgadmin
     restart: unless-stopped
-    environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    env_file:
+      - .env
     ports:
       - "${PGADMIN_PORT:-8080}:80"
     depends_on:
       - postgres
     volumes:
       - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  pgdata:
+  pgadmin_data:

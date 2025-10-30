@@ -1,28 +1,36 @@
 import os
-from typing import TypedDict, List, BaseModel, Field
+import json
+from typing import TypedDict, List, Dict, Optional
+from uuid import UUID
+import uuid
 
-from sqlalchemy import create_engine
-from langchain_community.utilities import SQLDatabase
-from langchain_community.tools import InfoSQLDatabaseTool, QuerySQLDatabaseTool
+from pydantic import BaseModel, Field
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import (
-    BaseMessage,
-    SystemMessage,
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-)
-from langchain.prebuilt import ToolNode
 from langgraph.graph import StateGraph
-from classes import Candidate, RateCandidate, RateCandidates, TopCandidates, Candidates
-from nodes import get_task, generate_accents, choose_candidates,rate_candidates, return_candidates, ask_next
 
+# Наши схемы и узлы
+from candidates import CandidateScore, TopCandidates
+from nodes import (
+    node_get_task,
+    node_generate_accents,
+    node_choose_candidates,
+    node_rate_candidates,
+    node_return_candidates,
+    node_ask_next,
+)
+
+# -----------------------------
+# Состояние графа (как у тебя)
+# -----------------------------
 class QueryVariants(BaseModel):
     accents: List[str] = Field(
         ...,
-        description='Описания разных вариантов, на что можно сделать акцент в ходе поиска',
+        description="Описания разных вариантов, на что можно сделать акцент в ходе поиска",
     )
-
 
 class State(TypedDict, total=False):
     task: str                            # исходный запрос рекрутера
@@ -31,25 +39,25 @@ class State(TypedDict, total=False):
     raw_candidates: List[TopCandidates]  # кандидаты по каждому акценту
     ranked: List[CandidateScore]         # итоговый топ
 
+# -----------------------------
+# Подключение к БД
+# -----------------------------
 DB_USER = os.getenv("POSTGRES_USER", "postgres")
 DB_PASS = os.getenv("POSTGRES_PASSWORD", "postgres")
 DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
 DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 DB_NAME = os.getenv("POSTGRES_DB", "candidates_db")
 
-pstrgesql = 'http://postgres/'
-
 engine = create_engine(
-    f"postgresql+psycopg://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
 )
 
-db = SQLDatabase(engine=engine)
-info_tool = InfoSQLDatabaseTool(db=db)
-query_tool = QuerySQLDatabaseTool(db=db)
-
+# ---------------------------------
+# LLM (как у тебя через переменные)
+# ---------------------------------
 llm = ChatOpenAI(
     model=os.getenv("API_MODEL"),
     api_key=os.getenv("API_KEY"),
@@ -57,7 +65,10 @@ llm = ChatOpenAI(
     temperature=0,
 )
 
-def fetch_candidates_by_ids(engine, ids: List[int]) -> Dict[int, dict]:
+# ----------------------------------------------------------
+# Утилита: получить карточки по списку id (оставил как было)
+# ----------------------------------------------------------
+def fetch_candidates_by_ids(engine, ids: List[UUID | str]) -> Dict[str, dict]:
     """
     Берём из БД реальные поля по списку айдишников.
     Возвращаем словарь {id: {...факты из базы...}}
@@ -66,7 +77,7 @@ def fetch_candidates_by_ids(engine, ids: List[int]) -> Dict[int, dict]:
         return {}
 
     placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
-    params = {f"id_{i}": cid for i, cid in enumerate(ids)}
+    params = {f"id_{i}": str(cid) for i, cid in enumerate(ids)}
 
     query = text(f"""
         SELECT
@@ -92,31 +103,70 @@ def fetch_candidates_by_ids(engine, ids: List[int]) -> Dict[int, dict]:
     with engine.connect() as conn:
         rows = conn.execute(query, params).mappings().all()
 
-    return {row["id"]: dict(row) for row in rows}
+    return {str(row["id"]): dict(row) for row in rows}
 
-from nodes import (
-    node_get_task,
-    node_generate_accents,
-    node_choose_candidates,
-    node_rate_candidates,
-    node_return_candidates,
-    node_ask_next,
-)
+# ----------------------------------------------------------
+# Обёртки-узлы для LangGraph (передаём llm и Session корректно)
+# ----------------------------------------------------------
+def _node_generate_accents(state: State) -> State:
+    return node_generate_accents(state, llm)
 
+def _node_choose_candidates(state: State) -> State:
+    # на каждый вызов узла открываем короткую сессию
+    with Session(bind=engine, expire_on_commit=False) as s:
+        return node_choose_candidates(state, llm, s)
+    
+def _node_add_candidates(state: State) -> State:
+    with Session(bind=engine, expire_on_commit=False) as s:
+        return node_add_candidates(
+            state, llm, s,
+            target_n=15,     # ← сколько хотим на акцент (поменяйте под себя)
+            batch_limit=30,  # ← размер batch из БД за итерацию
+            max_iters=3,     # ← ограничитель, чтобы не крутиться бесконечно
+        )
+
+def _node_rate_candidates(state: State) -> State:
+    # ранжирование через LLM и NormIDs (топ-10)
+    return node_rate_candidates(state, llm, top_n=10)
+
+def _node_return_candidates(state: State) -> State:
+    # текущая реализация узла печатает state["ranked"], fetch_* не требуется
+    # если захочешь: можно обогатить карточки из БД, вызвав fetch_candidates_by_ids
+    return node_return_candidates(state)
+
+
+# -----------------------------
+# Сборка графа
+# -----------------------------
 workflow = StateGraph(State)
 
 workflow.add_node("get_task", node_get_task)
-workflow.add_node("generate_accents", node_generate_accents(llm))
-workflow.add_node("choose_candidates", node_choose_candidates(llm, tools_node))
-workflow.add_node("rate_candidates", node_rate_candidates(llm))
-workflow.add_node("return_candidates", node_return_candidates(fetch_candidates_by_ids))
+workflow.add_node("generate_accents", _node_generate_accents)
+workflow.add_node("choose_candidates", _node_choose_candidates)
+workflow.add_node("add_candidates", _node_add_candidates)
+workflow.add_node("rate_candidates", _node_rate_candidates)
+workflow.add_node("return_candidates", _node_return_candidates)
 workflow.add_node("ask_next", node_ask_next)
+
+workflow.set_entry_point("get_task")
 
 workflow.add_edge("get_task", "generate_accents")
 workflow.add_edge("generate_accents", "choose_candidates")
+workflow.add_edge("choose_candidates", "add_candidates")
+workflow.add_edge("add_candidates", "rate_candidates")
 workflow.add_edge("choose_candidates", "rate_candidates")
 workflow.add_edge("rate_candidates", "return_candidates")
 workflow.add_edge("return_candidates", "ask_next")
 workflow.add_edge("ask_next", "generate_accents")
 
 app = workflow.compile()
+
+# ----------------------------------------------------------
+# (опционально) Простой запуск из CLI:
+# ----------------------------------------------------------
+if __name__ == "__main__":
+    # Пустое состояние — граф сам запросит задачу и пойдёт по циклу
+    state: State = {}
+    # Один проход цикла:
+    state = app.invoke(state)
+    # Если хочешь множественные итерации — вызывай несколько раз или оставь как есть (узел ask_next зацикливает граф)
