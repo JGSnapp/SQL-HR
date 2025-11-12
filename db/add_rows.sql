@@ -14,7 +14,7 @@ COPY candidates (
     resume_updated_at,
     has_car
 )
-FROM '/path/to/candidates.csv'
+FROM '../data/candidates.csv'
 WITH (
     FORMAT csv,
     HEADER true,

@@ -2,3 +2,4 @@ langgraph
 sqlalchemy
 psycopg2-binary
 langchain_community
+langchain-openai

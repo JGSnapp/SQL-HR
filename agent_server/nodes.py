@@ -392,6 +392,23 @@ def node_rate_candidates(state: State, llm, top_n: int = 10) -> State:
         state["ranked"] = [CandidateScore(candidate=it["candidate"], approved=it["approved"]) for it in ordered]
         return state
 
+def node_return_candidates(state: State) -> State:
+    ranked = state.get("ranked") or []
+    if not ranked:
+        return state
+
+    seen: set[str] = set()
+    deduped: list[CandidateScore] = []
+    for item in ranked:
+        cid = str(item.candidate.id)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        deduped.append(item)
+
+    state["ranked"] = deduped
+    return state
+
 def node_ask_next(state: State) -> State:
     try:
         followup = input(ASK_NEXT_PROMPT)

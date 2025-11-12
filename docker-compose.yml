@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  tlite:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: tlite
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models:ro
+    command: >
+      -m /models/T-lite-it-1.0-Q5_K_M.gguf
+      --host 0.0.0.0 --port 8000
+      -c 8192 --n-gpu-layers 35
+    deploy: {}
+    gpus: all
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  agent_server:
+    build:
+      context: ./agent_server
+    depends_on:
+      vllm_cpu:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      BASE_URL: ${AGENT_BASE_URL:-http://vllm_cpu:8000/v1}
+    restart: unless-stopped
+
+  postgres:
+    image: ankane/pgvector
+    container_name: postgres
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db/add_rows.sql:/docker-entrypoint-initdb.d/02-add_rows.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "${PGADMIN_PORT:-8080}:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  pgdata:
+  pgadmin_data:

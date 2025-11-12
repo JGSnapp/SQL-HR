@@ -18,6 +18,7 @@ from nodes import (
     node_get_task,
     node_generate_accents,
     node_choose_candidates,
+    node_add_candidates,
     node_rate_candidates,
     node_return_candidates,
     node_ask_next,
@@ -58,12 +59,33 @@ engine = create_engine(
 # ---------------------------------
 # LLM (как у тебя через переменные)
 # ---------------------------------
-llm = ChatOpenAI(
-    model=os.getenv("API_MODEL"),
-    api_key=os.getenv("API_KEY"),
-    base_url=os.getenv("BASE_URL"),
-    temperature=0,
-)
+def _build_llm() -> ChatOpenAI:
+    """
+    Helper ensures that defaults for local vLLM usage are applied before creating a client.
+    """
+    model = os.getenv("API_MODEL")
+    api_key = os.getenv("API_KEY") or os.getenv("VLLM_API_KEY")
+    base_url = (
+        os.getenv("BASE_URL")
+        or os.getenv("VLLM_BASE_URL")
+        or "http://localhost:8010/v1"
+    )
+
+    missing = [name for name, value in (("API_MODEL", model), ("API_KEY", api_key)) if not value]
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variables for LLM client: {', '.join(missing)}"
+        )
+
+    return ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0,
+    )
+
+
+llm = _build_llm()
 
 # ----------------------------------------------------------
 # Утилита: получить карточки по списку id (оставил как было)
