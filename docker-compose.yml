@@ -2,37 +2,59 @@ version: "3.9"
 
 services:
   tlite:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    build:
+      context: ./tlite_server
+      dockerfile: Dockerfile
     container_name: tlite
     ports:
       - "8000:8000"
+    environment:
+      VLLM_API_KEY: ${API_KEY:-local-key-123}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    command:
+      - "--model"
+      - "${TLITE_MODEL:-t-tech/T-lite-it-1.0}"
+      - "--served-model-name"
+      - "${API_MODEL:-tlite-local}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--api-key"
+      - "${API_KEY:-local-key-123}"
+      - "--max-model-len"
+      - "${TLITE_MAX_MODEL_LEN:-4096}"
+      - "--gpu-memory-utilization"
+      - "${TLITE_GPU_MEMORY_UTILIZATION:-0.90}"
+      - "--download-dir"
+      - "/models"
+      - "--enforce-eager"
+      - "--enable-json-output"
     volumes:
-      - ./models:/models:ro
-    command: >
-      -m /models/T-lite-it-1.0-Q5_K_M.gguf
-      --host 0.0.0.0 --port 8000
-      -c 8192 --n-gpu-layers 35
-    deploy: {}
-    gpus: all
+      - ${MODELS_DIR:-./models}:/models
+    device_requests:
+      - driver: nvidia
+        count: 1
+        capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
 
   agent_server:
     build:
       context: ./agent_server
     depends_on:
-      vllm_cpu:
+      tlite:
         condition: service_healthy
       postgres:
         condition: service_healthy
     env_file:
       - .env
     environment:
-      BASE_URL: ${AGENT_BASE_URL:-http://vllm_cpu:8000/v1}
+      BASE_URL: ${AGENT_BASE_URL:-http://tlite:8000/v1}
     restart: unless-stopped
 
   postgres:
