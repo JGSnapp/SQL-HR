@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import os
 import uuid
 import json
+import logging
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict, Literal
+
+logger = logging.getLogger(__name__)
+RESULT_FILE = Path(
+    os.getenv(
+        "RESULT_FILE",
+        Path(__file__).resolve().parent / "result.txt",
+    )
+)
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, or_
@@ -26,7 +38,11 @@ RELAX_QUERY_SYSTEM_PROMPT = (
 )
 
 # --- Простые текстовые промпты по умолчанию (можно заменить своими из prompts.py) ---
-GET_TASK_PROMPT = "Опиши вакансию или нужный профиль кандидата:"
+GET_TASK_PROMPT = (
+    "Найди опытного веб-разработчика (Fullstack) на WordPress с сильным знанием "
+    "HTML, CSS, JavaScript и PHP. Обязателен опыт более 10 лет, работа с CMS, "
+    "интеграциями и поддержкой крупных проектов."
+)
 GENERATE_ACCENTS_SYSTEM_PROMPT = (
     "Ты генерируешь 2–5 разных формулировок запроса ('акцентов') для поиска кандидатов. "
     "Коротко, по сути. Верни JSON со списком 'accents'."
@@ -53,15 +69,44 @@ class State(TypedDict, total=False):
 
 # --- Структуры, которые LLM заполняет в узлах ---
 class QuerySpec(BaseModel):
-    city: Optional[str] = None
-    min_salary_rub: Optional[int] = None
-    max_salary_rub: Optional[int] = None
-    ready_to_relocate: Optional[bool] = None
-    keywords_any: List[str] = Field(default_factory=list)
-    keywords_all: List[str] = Field(default_factory=list)
-    keywords_not: List[str] = Field(default_factory=list)
-    seniority: Optional[Literal["junior", "middle", "senior", "lead"]] = None
-    limit: int = Field(30, ge=5, le=100)
+    city: Optional[str] = Field(
+        default=None,
+        description="Название города/региона, который должен упоминаться в поле `city` кандидата.",
+    )
+    min_salary_rub: Optional[int] = Field(
+        default=None,
+        description="Нижняя граница ожидаемой зарплаты кандидата (в рублях).",
+    )
+    max_salary_rub: Optional[int] = Field(
+        default=None,
+        description="Верхняя граница ожидаемой зарплаты кандидата (в рублях).",
+    )
+    ready_to_relocate: Optional[bool] = Field(
+        default=None,
+        description="True/False, требуется ли готовность переезда.",
+    )
+    keywords_any: List[str] = Field(
+        default_factory=list,
+        description="Список ключевых слов, из которых должно встретиться хотя бы одно в `work_experience`.",
+    )
+    keywords_all: List[str] = Field(
+        default_factory=list,
+        description="Ключевые слова, которые обязательно должны присутствовать одновременно в `work_experience`.",
+    )
+    keywords_not: List[str] = Field(
+        default_factory=list,
+        description="Ключевые слова, которые не должны встречаться в `work_experience`.",
+    )
+    seniority: Optional[Literal["junior", "middle", "senior", "lead"]] = Field(
+        default=None,
+        description="Требуемый уровень кандидата (одно из: junior/middle/senior/lead).",
+    )
+    limit: int = Field(
+        5,
+        ge=5,
+        le=100,
+        description="Сколько строк вернуть в рамках одного запроса к БД.",
+    )
 
 
 class QueryVariants(BaseModel):
@@ -69,7 +114,7 @@ class QueryVariants(BaseModel):
 
 
 # --- Поиск через ORM по собранному QuerySpec ---
-def get_from_query(spec: QuerySpec, session: Session, top_n: int = 20) -> List[CandidateOut]:
+def get_from_query(spec: QuerySpec, session: Session, top_n: int = 5) -> List[CandidateOut]:
     clauses = []
     if spec.city:
         clauses.append(C.city.ilike(f"%{spec.city}%"))
@@ -102,31 +147,34 @@ def get_from_query(spec: QuerySpec, session: Session, top_n: int = 20) -> List[C
 
 # --- Узлы графа ---
 
-def node_get_task(state: State) -> State:
+def node_get_task(state: State) -> dict:
     """Для CLI: спросить задачу у пользователя, если её ещё нет в state."""
-    if not state.get("task"):
-        try:
-            task = input(GET_TASK_PROMPT).strip()
-        except EOFError:
-            task = ""
-        if task:
-            state["task"] = task
-    return state
+    task = GET_TASK_PROMPT.strip()
+    result = {"task": task}
+    logger.info("Обновленные данные после node_get_task: %s", result)
+    return result
 
 
-def node_generate_accents(state: State, llm) -> State:
+def node_generate_accents(state: State, llm) -> dict:
     msgs = [
         SystemMessage(content=GENERATE_ACCENTS_SYSTEM_PROMPT),
         HumanMessage(content=state.get("task", "")),
     ]
     structured = llm.with_structured_output(QueryVariants)
     accents_resp = structured.invoke(msgs)
-    state["accents"] = accents_resp.accents
-    return state
+    logger.info("Вывод LLM в node_generate_accents: %s", accents_resp.model_dump())
+    result = {"accents": accents_resp.accents}
+    logger.info("Обновленные данные после node_generate_accents: %s", result)
+    return result
 
+def node_choose_candidates(state: State, llm, session: Session) -> dict:
+    # Копируем уже существующее, если есть
+    groups: List[TopCandidates] = list(state.get("raw_candidates", []))
 
-def node_choose_candidates(state: State, llm, session: Session) -> State:
-    state.setdefault("raw_candidates", [])
+    def _short(txt: Optional[str], limit: int = 500) -> Optional[str]:
+        if not txt:
+            return txt
+        return txt if len(txt) <= limit else (txt[:limit] + "…")
 
     for accent in state.get("accents", []):
         # 1) LLM превращает акцент в QuerySpec
@@ -136,27 +184,51 @@ def node_choose_candidates(state: State, llm, session: Session) -> State:
             HumanMessage(content=CHOOSE_CANDIDATES_HUMAN_PROMPT_TEMPLATE.format(accent=accent)),
         ])
 
-        # 2) ORM-поиск по спецификации
-        raw_candidates = get_from_query(llm_query, session=session, top_n=llm_query.limit or 20)
+        logger.info("Вывод LLM в node_choose_candidates (QuerySpec): %s", llm_query.model_dump())
 
-        # 3) Нормализация/отбор id через LLM (по желанию — можно пропустить и считать approved=True)
+        # 2) ORM-поиск по спецификации (жестко ограничиваем выборку 5 строками)
+        candidates = get_from_query(llm_query, session=session, top_n=5)
+
+        candidates_for_llm = [{
+            "id": str(c.id),
+            "desired_position": c.desired_position,
+            "city": c.city,
+            "expected_salary_rub": c.expected_salary_rub,
+            "resume_updated_at": c.resume_updated_at.isoformat() if c.resume_updated_at else None,
+            "work_experience": _short(c.work_experience),
+        } for c in candidates]
+
+        # 3) Нормализация/отбор id через LLM
         norm_llm = llm.with_structured_output(NormIDs)
         msgs = [
             SystemMessage(content=RATE_CANDIDATES_SYSTEM_PROMPT),
             HumanMessage(content=f"Запрос: {state.get('task','')}"),
-            HumanMessage(content="\n".join(c.model_dump_json() for c in raw_candidates)),
+            HumanMessage(content=f"Кандидаты:\n{json.dumps(candidates_for_llm, ensure_ascii=False)}"),
         ]
         try:
             norm_ids = norm_llm.invoke(msgs).candidates
+            logger.info("Вывод LLM в node_choose_candidates (NormIDs): %s", [str(nid) for nid in norm_ids])
             ids_set = set(norm_ids)
-            ready = [CandidateScore(candidate=c, approved=(c.id in ids_set)) for c in raw_candidates]
+            ready = [CandidateScore(candidate=c, approved=(c.id in ids_set)) for c in candidates]
         except Exception:
-            # если LLM не справилась со структурой — отметим всех как approved
-            ready = [CandidateScore(candidate=c, approved=True) for c in raw_candidates]
+            logger.exception(
+                "node_choose_candidates: failed to score candidates for accent `%s`, approving all",
+                accent,
+            )
+            ready = [CandidateScore(candidate=c, approved=True) for c in candidates]
 
-        state["raw_candidates"].append(TopCandidates(accent=accent, candidates=ready))
+        groups.append(TopCandidates(accent=accent, candidates=ready))
 
-    return state
+    logger.info("Обновленные данные после node_choose_candidates: %s", {"groups": len(groups)})
+    return {"raw_candidates": groups}
+
+
+def node_test_db(state: State, session: Session) -> dict:
+    sample = session.execute(select(C).limit(5)).scalars().all()
+    serialized = [CandidateOut.model_validate(item).model_dump() for item in sample]
+    logger.info("Выборка test_db (5 записей): %s", serialized)
+    return {}
+
 
 # --- Подсказка для LLM: как ослаблять запрос ---
 RELAX_QUERY_SYSTEM_PROMPT = (
@@ -172,25 +244,25 @@ def node_add_candidates(
     state: State,
     llm,
     session: Session,
-    target_n: int = 15,      # сколько в итоге хотим на 1 акцент
-    batch_limit: int = 30,   # сколько тянуть за итерацию из БД
+    target_n: int = 5,       # сколько в итоге хотим на 1 акцент
+    batch_limit: int = 5,    # сколько тянуть за итерацию из БД
     max_iters: int = 3,      # максимум итераций расширения на акцент
-) -> State:
+) -> dict:
     """
     Для каждого акцента, уже имеющегося в state['raw_candidates'],
     добирает недостающих кандидатов: на каждой итерации LLM ослабляет QuerySpec,
     мы тянем batch из БД и просим LLM выбрать до недостающего количества id.
     """
-    if not state.get("raw_candidates"):
-        return state
 
     # helper: аккуратно урезать текст, чтобы не раздувать контекст LLM
-    def _short(txt: Optional[str], limit: int = 600) -> Optional[str]:
+    def _short(txt: Optional[str], limit: int = 500) -> Optional[str]:
         if not txt:
             return txt
         return txt if len(txt) <= limit else (txt[:limit] + "…")
+    
+    raw_candidates = list(state.get("raw_candidates", []))
 
-    for group in state["raw_candidates"]:
+    for group in raw_candidates:
         accent = group.accent
 
         # текущее состояние по акценту
@@ -210,6 +282,10 @@ def node_add_candidates(
             SystemMessage(content=CHOOSE_CANDIDATES_SYSTEM_PROMPT),
             HumanMessage(content=CHOOSE_CANDIDATES_HUMAN_PROMPT_TEMPLATE.format(accent=accent)),
         ])
+        logger.info(
+            "Вывод LLM в node_add_candidates (base QuerySpec): %s",
+            {"accent": accent, "qspec": qspec.model_dump()},
+        )
         qspec.limit = min(qspec.limit or batch_limit, batch_limit)
 
         for it in range(max_iters):
@@ -218,7 +294,7 @@ def node_add_candidates(
                 break
 
             # 1) Тянем новый batch из БД по текущему qspec
-            pool = get_from_query(qspec, session=session, top_n=qspec.limit or batch_limit)
+            pool = get_from_query(qspec, session=session, top_n=5)
             # выбросим уже виденных
             pool = [c for c in pool if c.id not in seen_ids]
 
@@ -233,7 +309,7 @@ def node_add_candidates(
                         f"Уже виденные id (исключи их): {[str(i) for i in seen_ids]}"
                     ))
                 ])
-                relax.limit = batch_limit
+                relax.limit = 5
                 qspec = relax
                 continue
 
@@ -261,7 +337,13 @@ def node_add_candidates(
 
             try:
                 picked = norm_llm.invoke([sys, user]).candidates
+                logger.info("Вывод LLM в node_add_candidates (picked ids): %s", {"accent": accent, "iteration": it + 1, "picked": [str(pid) for pid in picked]})
             except Exception:
+                logger.exception(
+                    "node_add_candidates: LLM failed to pick candidates for accent `%s` iteration %d",
+                    accent,
+                    it + 1,
+                )
                 picked = []
 
             # фильтруем только новых, которых ещё не брали
@@ -287,12 +369,26 @@ def node_add_candidates(
                         f"Уже виденные id (исключи их): {[str(i) for i in seen_ids]}"
                     ))
                 ])
-                relax.limit = batch_limit
+                relax.limit = 5
                 qspec = relax
 
-    return state
+    logger.info("Обновленные данные после node_add_candidates: %s", {"groups_processed": len(raw_candidates)})
+    return {}
 
-def node_rate_candidates(state: State, llm, top_n: int = 10) -> State:
+def _dedupe_scores(items: List[CandidateScore]) -> List[CandidateScore]:
+    """Remove duplicated candidates while preserving ordering."""
+    seen: set[uuid.UUID] = set()
+    deduped: list[CandidateScore] = []
+    for item in items:
+        cid = item.candidate.id
+        if cid in seen:
+            continue
+        seen.add(cid)
+        deduped.append(item)
+    return deduped
+
+
+def node_rate_candidates(state: State, llm, top_n: int = 5) -> dict:
     """
     Ранжирует кандидатов силами LLM:
     - собирает плоский список кандидатов из state["raw_candidates"];
@@ -311,11 +407,11 @@ def node_rate_candidates(state: State, llm, top_n: int = 10) -> State:
                 items_by_id[cid]["approved"] = items_by_id[cid]["approved"] or bool(cs.approved)
 
     if not items_by_id:
-        state["ranked"] = []
-        return state
+        logger.info("node_rate_candidates: nothing to rank")
+        return {"ranked": []}
 
     # 2) Подготовка компактного JSON для LLM (не раздуваем контекст).
-    def _short(txt: Optional[str], limit: int = 600) -> Optional[str]:
+    def _short(txt: Optional[str], limit: int = 500) -> Optional[str]:
         if not txt:
             return txt
         return txt if len(txt) <= limit else (txt[:limit] + "…")
@@ -380,40 +476,79 @@ def node_rate_candidates(state: State, llm, top_n: int = 10) -> State:
                 item = items_by_id[cid]
                 ranked.append(CandidateScore(candidate=item["candidate"], approved=item["approved"]))
 
-        state["ranked"] = ranked
-        return state
+        ranked = _dedupe_scores(ranked)
+        logger.info("node_rate_candidates: ranked %d candidates", len(ranked))
+        return {"ranked": ranked}
 
     except Exception:
         # Фолбэк: без LLM — approved сначала, затем остальные (до top_n).
+        logger.exception("node_rate_candidates: exception during ranking, falling back to deterministic ordering")
         ordered = sorted(
             items_by_id.values(),
             key=lambda it: (not it["approved"], - (it["candidate"].expected_salary_rub or 0))
         )[:top_n]
-        state["ranked"] = [CandidateScore(candidate=it["candidate"], approved=it["approved"]) for it in ordered]
-        return state
+        fallback_ranked = _dedupe_scores([
+            CandidateScore(candidate=it["candidate"], approved=it["approved"])
+            for it in ordered
+        ])
+        logger.info("node_rate_candidates: fallback ranked %d candidates", len(fallback_ranked))
+        return {"ranked": fallback_ranked}
 
-def node_return_candidates(state: State) -> State:
-    ranked = state.get("ranked") or []
+def node_return_candidates(state: State) -> dict:
+    ranked = state.get("ranked")
     if not ranked:
-        return state
+        logger.info("node_return_candidates: nothing to return")
+        return {}
 
-    seen: set[str] = set()
-    deduped: list[CandidateScore] = []
+    logger.info("node_return_candidates: deduped to %d entries", len(ranked))
+    serialized = []
     for item in ranked:
-        cid = str(item.candidate.id)
-        if cid in seen:
-            continue
-        seen.add(cid)
-        deduped.append(item)
+        candidate = item.candidate
+        serialized.append({
+            "id": str(candidate.id),
+            "approved": bool(item.approved),
+            "desired_position": candidate.desired_position,
+            "city": candidate.city,
+            "expected_salary_rub": candidate.expected_salary_rub,
+            "ready_to_relocate": candidate.ready_to_relocate,
+            "resume_updated_at": candidate.resume_updated_at.isoformat()
+            if candidate.resume_updated_at else None,
+            "work_experience": candidate.work_experience,
+        })
 
-    state["ranked"] = deduped
-    return state
+    payload = {"total": len(serialized), "candidates": serialized}
+    targets = [RESULT_FILE]
+    fallback = Path(tempfile.gettempdir()) / RESULT_FILE.name
+    if fallback not in targets:
+        targets.append(fallback)
 
-def node_ask_next(state: State) -> State:
-    try:
-        followup = input(ASK_NEXT_PROMPT)
-    except EOFError:
-        followup = ""
-    if followup.strip():
-        state["extra_task"] = followup.strip()
-    return state
+    dump = json.dumps(payload, ensure_ascii=False, indent=2)
+    for target in targets:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(dump, encoding="utf-8")
+            logger.info("node_return_candidates: wrote results to %s", target)
+            break
+        except PermissionError:
+            logger.warning(
+                "node_return_candidates: permission denied for %s, trying fallback",
+                target,
+            )
+        except Exception:
+            logger.exception(
+                "node_return_candidates: failed to write results to %s",
+                target,
+            )
+    else:
+        logger.error(
+            "node_return_candidates: exhausted all targets %s",
+            [str(t) for t in targets],
+        )
+
+    return {}
+
+def node_ask_next(state: State) -> dict:
+    followup = ASK_NEXT_PROMPT
+    logger.info("node_ask_next: recorded followup `%s`", followup[:80])
+    return {"extra_task": followup}
+

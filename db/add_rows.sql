@@ -1,5 +1,6 @@
 COPY candidates (
     sex,
+    age,
     expected_salary_rub,
     desired_position,
     city,
@@ -14,10 +15,11 @@ COPY candidates (
     resume_updated_at,
     has_car
 )
-FROM '../data/candidates.csv'
+FROM '/data/candidates.csv'
 WITH (
     FORMAT csv,
     HEADER true,
     DELIMITER ',',
-    ENCODING 'UTF8'
+    ENCODING 'UTF8',
+    NULL ''
 );

@@ -4,6 +4,7 @@ CREATE TABLE candidates (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     sex TEXT,
+    age INTEGER,
     expected_salary_rub INTEGER,
     desired_position TEXT,
     city TEXT,

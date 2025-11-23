@@ -1,39 +1,65 @@
-version: "3.9"
-
 services:
-  tlite:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
-    container_name: tlite
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./models:/models:ro
-    command: >
-      -m /models/T-lite-it-1.0-Q5_K_M.gguf
-      --host 0.0.0.0 --port 8000
-      -c 8192 --n-gpu-layers 35
-    deploy: {}
-    gpus: all
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
     restart: unless-stopped
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/root/.cache/huggingface
+      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
+      - TORCH_HOME=/root/.cache/huggingface
+      - VLLM_DOWNLOAD_DIR=/root/.cache/huggingface
+      - HF_HUB_ENABLE_HF_TRANSFER=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - --model
+      - Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+      - --gpu-memory-utilization
+      - "0.75"
+      - --max-model-len
+      - "20000"
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8001"
+
+    ports:
+      - "${VLLM_HOST_PORT:-18001}:8001"
+
+    volumes:
+      - ./hf-cache:/root/.cache/huggingface
+
+    ipc: host
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8001/v1/models >/dev/null 2>&1"]
+      interval: 20s
       timeout: 5s
-      retries: 6
+      retries: 60
+      start_period: 600s
 
   agent_server:
     build:
       context: ./agent_server
     depends_on:
-      vllm_cpu:
+      vllm:
         condition: service_healthy
       postgres:
         condition: service_healthy
     env_file:
       - .env
     environment:
-      BASE_URL: ${AGENT_BASE_URL:-http://vllm_cpu:8000/v1}
-    restart: unless-stopped
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://vllm:8001/v1}
+      BASE_URL: ${LLM_BASE_URL:-http://vllm:8001/v1}
+      RESULT_FILE: /results/result.txt
+    volumes:
+      - ./results:/results
 
   postgres:
     image: ankane/pgvector
@@ -45,6 +71,7 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./data/candidates.csv:/data/candidates.csv:ro
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./db/add_rows.sql:/docker-entrypoint-initdb.d/02-add_rows.sql:ro
     healthcheck:

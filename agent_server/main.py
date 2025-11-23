@@ -1,8 +1,6 @@
 import os
-import json
 from typing import TypedDict, List, Dict, Optional
 from uuid import UUID
-import uuid
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +9,9 @@ from sqlalchemy.orm import Session
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
+
+import logging
+logging.basicConfig(level=logging.INFO)
 
 # Наши схемы и узлы
 from candidates import CandidateScore, TopCandidates
@@ -22,6 +23,7 @@ from nodes import (
     node_rate_candidates,
     node_return_candidates,
     node_ask_next,
+    node_test_db,
 )
 
 # -----------------------------
@@ -59,33 +61,17 @@ engine = create_engine(
 # ---------------------------------
 # LLM (как у тебя через переменные)
 # ---------------------------------
-def _build_llm() -> ChatOpenAI:
-    """
-    Helper ensures that defaults for local vLLM usage are applied before creating a client.
-    """
-    model = os.getenv("API_MODEL")
-    api_key = os.getenv("API_KEY") or os.getenv("VLLM_API_KEY")
-    base_url = (
-        os.getenv("BASE_URL")
-        or os.getenv("VLLM_BASE_URL")
-        or "http://localhost:8010/v1"
-    )
 
-    missing = [name for name, value in (("API_MODEL", model), ("API_KEY", api_key)) if not value]
-    if missing:
-        raise RuntimeError(
-            f"Missing required environment variables for LLM client: {', '.join(missing)}"
-        )
+LLM_MODEL = os.getenv("LLM_MODEL")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8010/v1")
 
-    return ChatOpenAI(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+llm = ChatOpenAI(
+        model=LLM_MODEL,
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
         temperature=0,
     )
-
-
-llm = _build_llm()
 
 # ----------------------------------------------------------
 # Утилита: получить карточки по списку id (оставил как было)
@@ -157,11 +143,17 @@ def _node_return_candidates(state: State) -> State:
     return node_return_candidates(state)
 
 
+def _node_test_db(state: State) -> State:
+    with Session(bind=engine, expire_on_commit=False) as s:
+        return node_test_db(state, s)
+
+
 # -----------------------------
 # Сборка графа
 # -----------------------------
 workflow = StateGraph(State)
 
+workflow.add_node("test_db", _node_test_db)
 workflow.add_node("get_task", node_get_task)
 workflow.add_node("generate_accents", _node_generate_accents)
 workflow.add_node("choose_candidates", _node_choose_candidates)
@@ -170,8 +162,9 @@ workflow.add_node("rate_candidates", _node_rate_candidates)
 workflow.add_node("return_candidates", _node_return_candidates)
 workflow.add_node("ask_next", node_ask_next)
 
-workflow.set_entry_point("get_task")
+workflow.set_entry_point("test_db")
 
+workflow.add_edge("test_db", "get_task")
 workflow.add_edge("get_task", "generate_accents")
 workflow.add_edge("generate_accents", "choose_candidates")
 workflow.add_edge("choose_candidates", "add_candidates")
@@ -179,7 +172,7 @@ workflow.add_edge("add_candidates", "rate_candidates")
 workflow.add_edge("choose_candidates", "rate_candidates")
 workflow.add_edge("rate_candidates", "return_candidates")
 workflow.add_edge("return_candidates", "ask_next")
-workflow.add_edge("ask_next", "generate_accents")
+
 
 app = workflow.compile()
 
