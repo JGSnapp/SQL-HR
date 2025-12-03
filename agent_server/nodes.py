@@ -29,12 +29,15 @@ from candidates import (
     TopCandidates,
     NormIDs,
 )
+from prompts import CHOOSE_CANDIDATES_SYSTEM_PROMPT
+
 RELAX_QUERY_SYSTEM_PROMPT = (
     "Тебе дан акцент (формулировка поиска) и текущая выборка кандидатов. "
     "Нужно ДОБРАТЬ ещё кандидатов: сгенерируй новую спецификацию QuerySpec, которая расширит охват, "
     "но останется релевантной: допускается смягчить salary, добавить синонимы в keywords_any, "
     "снять часть keywords_all, расширить город (агломерации/удалёнка). "
-    "Всегда указывай limit (batch_limit). Верни строго JSON модели QuerySpec."
+    "Всегда отвечай по-русски, кроме названий/имен. "
+    "Всегда указывай limit (batch_limit). Верни строго JSON модели QuerySpec, никакого текста вне JSON."
 )
 
 # --- Простые текстовые промпты по умолчанию (можно заменить своими из prompts.py) ---
@@ -47,9 +50,7 @@ GENERATE_ACCENTS_SYSTEM_PROMPT = (
     "Ты генерируешь 2–5 разных формулировок запроса ('акцентов') для поиска кандидатов. "
     "Коротко, по сути. Верни JSON со списком 'accents'."
 )
-CHOOSE_CANDIDATES_SYSTEM_PROMPT = (
-    "Ты выделяешь структуру фильтров QuerySpec (город, зарплата, ключевые слова) из данного акцента."
-)
+ 
 CHOOSE_CANDIDATES_HUMAN_PROMPT_TEMPLATE = "Акцент: {accent}"
 PREVIOUS_RESULTS_SYSTEM_PROMPT = "Это предыдущие найденные кандидаты."
 RATE_CANDIDATES_SYSTEM_PROMPT = (
@@ -112,7 +113,6 @@ class QuerySpec(BaseModel):
 class QueryVariants(BaseModel):
     accents: List[str] = Field(..., min_items=1, max_items=8)
 
-
 # --- Поиск через ORM по собранному QuerySpec ---
 def get_from_query(spec: QuerySpec, session: Session, top_n: int = 5) -> List[CandidateOut]:
     clauses = []
@@ -146,14 +146,6 @@ def get_from_query(spec: QuerySpec, session: Session, top_n: int = 5) -> List[Ca
 
 
 # --- Узлы графа ---
-
-def node_get_task(state: State) -> dict:
-    """Для CLI: спросить задачу у пользователя, если её ещё нет в state."""
-    task = GET_TASK_PROMPT.strip()
-    result = {"task": task}
-    logger.info("Обновленные данные после node_get_task: %s", result)
-    return result
-
 
 def node_generate_accents(state: State, llm) -> dict:
     msgs = [
@@ -300,17 +292,20 @@ def node_add_candidates(
 
             if not pool:
                 # 2a) Если новых нет — просим LLM расширить запрос
-                relax = llm.with_structured_output(QuerySpec).invoke([
-                    SystemMessage(content=RELAX_QUERY_SYSTEM_PROMPT),
-                    HumanMessage(content=(
-                        f"Акцент: {accent}\n"
-                        f"Нужно добрать ещё: {need}\n"
-                        f"Текущая спецификация: {qspec.model_dump_json()}\n"
-                        f"Уже виденные id (исключи их): {[str(i) for i in seen_ids]}"
-                    ))
-                ])
-                relax.limit = 5
-                qspec = relax
+                try:
+                    relax = llm.with_structured_output(QuerySpec).invoke([
+                        SystemMessage(content=RELAX_QUERY_SYSTEM_PROMPT),
+                        HumanMessage(content=(
+                            f"Акцент: {accent}\n"
+                            f"Нужно добрать ещё: {need}\n"
+                            f"Текущая спецификация: {qspec.model_dump_json()}"
+                        ))
+                    ])
+                    relax.limit = 5
+                    qspec = relax
+                except Exception:
+                    logger.exception("node_add_candidates: не удалось ослабить запрос для акцента `%s`", accent)
+                    break
                 continue
 
             # 2b) Просим LLM выбрать до need id из pool
@@ -499,7 +494,12 @@ def node_return_candidates(state: State) -> dict:
     if not ranked:
         logger.info("node_return_candidates: nothing to return")
         return {}
-
+    
+    def _short(txt: Optional[str], limit: int = 500) -> Optional[str]:
+        if not txt:
+            return txt
+        return txt if len(txt) <= limit else (txt[:limit] + "…")
+    
     logger.info("node_return_candidates: deduped to %d entries", len(ranked))
     serialized = []
     for item in ranked:
@@ -513,7 +513,7 @@ def node_return_candidates(state: State) -> dict:
             "ready_to_relocate": candidate.ready_to_relocate,
             "resume_updated_at": candidate.resume_updated_at.isoformat()
             if candidate.resume_updated_at else None,
-            "work_experience": candidate.work_experience,
+            "work_experience": _short(candidate.work_experience),
         })
 
     payload = {"total": len(serialized), "candidates": serialized}
