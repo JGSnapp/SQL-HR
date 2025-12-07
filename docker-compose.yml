@@ -29,6 +29,9 @@ services:
       - "0.0.0.0"
       - --port
       - "8001"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - hermes
 
     ports:
       - "${VLLM_HOST_PORT:-18001}:8001"
@@ -60,6 +63,28 @@ services:
       RESULT_FILE: /results/result.txt
     volumes:
       - ./results:/results
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      agent_server:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      SERVER_URL: ${SERVER_URL:-http://agent_server}
+      HOME: /app
+      STREAMLIT_BROWSER_GATHERUSAGESTATS: "false"
+      STREAMLIT_CONFIG_DIR: /app/.streamlit
+    ports:
+      - "8501:8501"
 
   postgres:
     image: ankane/pgvector

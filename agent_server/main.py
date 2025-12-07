@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
+import ast
 import uuid
 import logging
-import re
 from typing import TypedDict, List, Dict, Optional, Any, Literal
 from uuid import UUID
 
@@ -39,16 +40,10 @@ from nodes import (
     node_test_db,
 )
 
-# -----------------------------
-# Логгер
-# -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# Тип состояния графа кандидатов
-# -----------------------------
 class CandidateState(TypedDict, total=False):
     task: str
     extra_task: str
@@ -57,9 +52,6 @@ class CandidateState(TypedDict, total=False):
     ranked: List[CandidateScore]
 
 
-# -----------------------------
-# Подключение к БД
-# -----------------------------
 DB_USER = os.getenv("POSTGRES_USER", "postgres")
 DB_PASS = os.getenv("POSTGRES_PASSWORD", "postgres")
 DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
@@ -74,9 +66,6 @@ engine = create_engine(
 )
 
 
-# -----------------------------
-# LLM
-# -----------------------------
 LLM_MODEL = os.getenv("LLM_MODEL")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8010/v1")
@@ -91,9 +80,6 @@ llm = ChatOpenAI(
 )
 
 
-# ----------------------------------------------------------
-# Утилита: получить карточки по списку id из БД
-# ----------------------------------------------------------
 def fetch_candidates_by_ids(engine, ids: List[UUID | str]) -> Dict[str, Dict[str, Any]]:
     """
     Берём из БД реальные поля по списку айдишников.
@@ -134,9 +120,6 @@ def fetch_candidates_by_ids(engine, ids: List[UUID | str]) -> Dict[str, Dict[str
     return {str(row["id"]): dict(row) for row in rows}
 
 
-# ----------------------------------------------------------
-# Обёртки-узлы для LangGraph (передаём llm и Session)
-# ----------------------------------------------------------
 def _node_generate_accents(state: CandidateState) -> CandidateState:
     return node_generate_accents(state, llm)
 
@@ -171,10 +154,6 @@ def _node_test_db(state: CandidateState) -> CandidateState:
     with Session(bind=engine, expire_on_commit=False) as s:
         return node_test_db(state, s)
 
-
-# -----------------------------
-# Граф подбора кандидатов
-# -----------------------------
 candidate_workflow = StateGraph(CandidateState)
 
 candidate_workflow.add_node("test_db", _node_test_db)
@@ -216,9 +195,6 @@ def choose_candidates(query: str) -> List[str]:
     return ids
 
 
-# -----------------------------
-# Граф-агент с tool calling
-# -----------------------------
 def add_messages(left: List[AnyMessage], right: List[AnyMessage]) -> List[AnyMessage]:
     return left + right
 
@@ -265,9 +241,6 @@ main_workflow.add_edge("tools", "agent")
 graph_app = main_workflow.compile()
 
 
-# -----------------------------
-# FastAPI-приложение
-# -----------------------------
 app = FastAPI(title="SQL-HR Chat API")
 
 # Память диалогов: session_id -> история сообщений LangChain
@@ -279,10 +252,6 @@ CHAT_SYSTEM_PROMPT = (
     "Когда человек просит подобрать кандидатов (или информации достаточно), "
     "вызови инструмент choose_candidates. "
     "Говори по-русски, дружелюбно, без лишней воды."
-)
-
-UUID_PATTERN = re.compile(
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 
 
@@ -302,29 +271,47 @@ class ChatResponse(BaseModel):
 
 
 def _extract_candidate_ids(messages: List[AnyMessage]) -> List[str]:
-    """Достаём id из свежих ToolMessage choose_candidates в этом прогоне."""
     ids: List[str] = []
-    seen: set[str] = set()
     for msg in messages:
         if isinstance(msg, ToolMessage) and msg.name == "choose_candidates":
             content = msg.content
+            parsed: List[str] = []
+
             if isinstance(content, list):
-                for x in content:
-                    sx = str(x)
-                    if sx not in seen:
-                        ids.append(sx)
-                        seen.add(sx)
+                parsed = [str(x) for x in content]
+            elif isinstance(content, str):
+                # LangChain кладёт результат тула как строку; пытаемся распарсить список/JSON
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        parsed = [str(x) for x in data]
+                    elif isinstance(data, dict):
+                        cand_list = data.get("candidates")
+                        if isinstance(cand_list, list):
+                            parsed = [str(x) for x in cand_list]
+                except Exception:
+                    try:
+                        data = ast.literal_eval(content)
+                        if isinstance(data, list):
+                            parsed = [str(x) for x in data]
+                        elif isinstance(data, dict):
+                            cand_list = data.get("candidates")
+                            if isinstance(cand_list, list):
+                                parsed = [str(x) for x in cand_list]
+                    except Exception:
+                        logger.warning(
+                            "Не удалось распарсить содержимое choose_candidates: %s",
+                            content,
+                        )
+
+            if parsed:
+                ids.extend(parsed)
     return ids
-
-
-def _extract_tool_messages(messages: List[AnyMessage]) -> List[ToolMessage]:
-    return [m for m in messages if isinstance(m, ToolMessage)]
 
 
 @app.post("/", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id or str(uuid.uuid4())
-    logger.info("chat: session=%s incoming=%s", session_id, req.message)
     if session_id not in SESSIONS:
         SESSIONS[session_id] = [SystemMessage(content=CHAT_SYSTEM_PROMPT)]
 
@@ -338,23 +325,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
     ai_msgs = [m for m in all_messages if isinstance(m, AIMessage)]
     answer = ai_msgs[-1].content if ai_msgs else ""
 
-    # сохраняем tool_messages и ai_messages из текущего прогона в историю для следующего шага
-    tool_msgs = _extract_tool_messages(all_messages)
-    history.extend(tool_msgs)
     if ai_msgs:
         history.append(ai_msgs[-1])
 
-    # --- 6. Если агент вызывал choose_candidates — достаём id ---
     candidate_ids = _extract_candidate_ids(all_messages)
     candidate_profiles = fetch_candidates_by_ids(engine, candidate_ids)
-    logger.info(
-        "chat: session=%s extracted_ids=%s profiles=%d",
-        session_id,
-        candidate_ids,
-        len(candidate_profiles),
-    )
 
-    # --- 7. Возвращаем и answer, и session_id, и кандидатов ---
     return ChatResponse(
         session_id=session_id,
         answer=answer,
