@@ -1,65 +1,21 @@
 services:
-  vllm:
-    image: vllm/vllm-openai:latest
-    container_name: vllm
-    restart: unless-stopped
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - HF_HOME=/root/.cache/huggingface
-      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
-      - TORCH_HOME=/root/.cache/huggingface
-      - VLLM_DOWNLOAD_DIR=/root/.cache/huggingface
-      - HF_HUB_ENABLE_HF_TRANSFER=0
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command:
-      - --model
-      - Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
-      - --gpu-memory-utilization
-      - "0.75"
-      - --max-model-len
-      - "20000"
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8001"
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - hermes
-
-    ports:
-      - "${VLLM_HOST_PORT:-18001}:8001"
-
-    volumes:
-      - ./hf-cache:/root/.cache/huggingface
-
-    ipc: host
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8001/v1/models >/dev/null 2>&1"]
-      interval: 20s
-      timeout: 5s
-      retries: 60
-      start_period: 600s
-
   agent_server:
     build:
       context: ./agent_server
     depends_on:
-      vllm:
-        condition: service_healthy
       postgres:
         condition: service_healthy
     env_file:
       - .env
     environment:
+      USE_VLLM: ${USE_VLLM:-true}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://vllm:8001/v1}
-      BASE_URL: ${LLM_BASE_URL:-http://vllm:8001/v1}
+      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4}
+      VLLM_KEY: ${VLLM_KEY:-fake-key}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://vllm:8001/v1}
+      PROXY_MODEL: ${PROXY_MODEL:-gpt-4o-mini}
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+      PROXY_BASE_URL: ${PROXY_BASE_URL:-https://api.openai.com/v1}
       RESULT_FILE: /results/result.txt
     volumes:
       - ./results:/results

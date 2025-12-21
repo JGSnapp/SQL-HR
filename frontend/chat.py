@@ -54,7 +54,6 @@ if prompt:
                 r = requests.post(
                     SERVER_URL,
                     json=payload,
-                    timeout=60,
                 )
                 r.raise_for_status()
                 r_json = r.json()
